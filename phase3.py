@@ -10,8 +10,8 @@ class GlobalIDManager:
     def __init__(self, similarity_threshold=0.5):
         self.similarity_threshold = similarity_threshold
         self.global_id_counter = 0
-        self.global_tracks = {}
-        self.camera_to_global = defaultdict(dict)
+        self.global_tracks = {}  # {global_id: {'feature': ..., 'cameras': set()}}
+        self.camera_to_global = defaultdict(dict)  # {camera_id: {local_id: global_id}}
         
     def cosine_similarity(self, feat1, feat2):
         """Calculate cosine similarity between two feature vectors"""
@@ -36,6 +36,7 @@ class GlobalIDManager:
         # Check if this local ID already has a global ID
         if local_id in self.camera_to_global[camera_id]:
             global_id = self.camera_to_global[camera_id][local_id]
+            # Update feature
             self.global_tracks[global_id]['feature'] = feature
             self.global_tracks[global_id]['cameras'].add(camera_id)
             return global_id
@@ -55,12 +56,14 @@ class GlobalIDManager:
                 best_match_id = global_id
         
         if best_match_id is not None:
-            print(f"  [CROSS-CAMERA MATCH!] Cam{camera_id} Local:{local_id} → Global:{best_match_id} (similarity: {best_similarity:.3f})")
+            # Matched to existing global ID
+            print(f"  [MATCH] Cam{camera_id} Local:{local_id} → Global:{best_match_id} (similarity: {best_similarity:.3f})")
             self.camera_to_global[camera_id][local_id] = best_match_id
             self.global_tracks[best_match_id]['feature'] = feature
             self.global_tracks[best_match_id]['cameras'].add(camera_id)
             return best_match_id
         else:
+            # Create new global ID
             return self._create_new_global_id(feature, camera_id, local_id)
     
     def _create_new_global_id(self, feature, camera_id, local_id):
@@ -94,19 +97,24 @@ def process_camera(video_path, camera_id, model, global_id_manager):
     print(f"Processing Camera {camera_id}: {video_path}")
     print(f"{'='*60}")
     
-    # Initialize DeepSORT with lower thresholds for better tracking
+    # Initialize DeepSORT tracker
     tracker = DeepSort(
-        max_age=30,           # Keep tracks alive for 30 frames without detection
-        n_init=1,             # Confirm track after just 1 detection (was 3)
+        max_age=30,
+        n_init=3,
         nms_max_overlap=0.7,
-        embedder="mobilenet"
+        embedder="mobilenet",
+        embedder_wts=None,
+        polygon=False,
+        today=None
     )
     
+    # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"ERROR: Cannot open {video_path}")
         return
     
+    # Get video properties
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -114,13 +122,14 @@ def process_camera(video_path, camera_id, model, global_id_manager):
     
     print(f"Video: {width}x{height} @ {fps}fps ({total_frames} frames)")
     
+    # Create output writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     output_path = f'output/camera{camera_id}_global.mp4'
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
     frame_count = 0
     local_tracks_seen = set()
-    total_detections = 0
+    detection_count = 0
     
     print("Processing frames...")
     
@@ -131,113 +140,134 @@ def process_camera(video_path, camera_id, model, global_id_manager):
         
         frame_count += 1
         
-        # YOLO detection with lower confidence
+        # Run YOLO detection with lower confidence threshold
         results = model(frame, classes=[0], verbose=False, conf=0.25)[0]
         
-        # Convert to DeepSORT format
+        # Prepare detections for DeepSORT
         raw_detections = []
         
         if len(results.boxes) > 0:
-            total_detections += len(results.boxes)
-            
+            detection_count += len(results.boxes)
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 conf = float(box.conf[0].cpu().numpy())
                 w = x2 - x1
                 h = y2 - y1
                 
-                # Skip tiny detections
+                # Skip very small detections
                 if w < 20 or h < 20:
                     continue
                 
                 bbox = [float(x1), float(y1), float(w), float(h)]
                 raw_detections.append((bbox, conf, 'person'))
         
-        # Update tracker
-        tracks = tracker.update_tracks(raw_detections, frame=frame)
+        # Update DeepSORT tracker
+        try:
+            if len(raw_detections) > 0:
+                tracks = tracker.update_tracks(raw_detections, frame=frame)
+            else:
+                # No detections this frame
+                tracks = []
+        except Exception as e:
+            print(f"  Warning at frame {frame_count}: {e}")
+            tracks = []
         
-        # Process tracks
-        active_tracks = 0
+        # Process each track
         for track in tracks:
             if not track.is_confirmed():
                 continue
             
-            active_tracks += 1
             local_id = track.track_id
             local_tracks_seen.add(local_id)
             
-            # Get feature
-            feature = track.get_feature() if hasattr(track, 'get_feature') else None
+            # Get ReID feature
+            try:
+                feature = track.get_feature()
+            except:
+                feature = None
             
             # Match to global ID
-            global_id = global_id_manager.match_to_global_id(feature, camera_id, local_id)
+            global_id = global_id_manager.match_to_global_id(
+                feature, camera_id, local_id
+            )
             
-            # Draw
+            # Draw bounding box
             bbox = track.to_ltrb()
             x1, y1, x2, y2 = map(int, bbox)
             
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
+            # Create label
             label = f"Cam{camera_id} L:{local_id} G:{global_id}"
-            cv2.putText(frame, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Draw label with background
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(frame, (x1, y1 - label_h - 10), (x1 + label_w, y1), (0, 255, 0), -1)
+            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
+        # Write frame
         out.write(frame)
         
-        # More frequent progress updates
-        if frame_count % 10 == 0 or frame_count == 1:
+        # Progress update
+        if frame_count % 30 == 0:
             progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
-            print(f"  Frame {frame_count:3d}/{total_frames} ({progress:5.1f}%) | Detections: {len(raw_detections)} | Active tracks: {active_tracks}")
+            print(f"  Frame {frame_count}/{total_frames} ({progress:.1f}%) - Detections: {len(raw_detections)}, Tracks: {len([t for t in tracks if t.is_confirmed()])}")
     
     cap.release()
     out.release()
     
-    print(f"\nCamera {camera_id} Summary:")
-    print(f"  ✓ Frames processed: {frame_count}")
-    print(f"  ✓ Total YOLO detections: {total_detections}")
-    print(f"  ✓ Unique tracks created: {len(local_tracks_seen)}")
-    print(f"  ✓ Output: {output_path}")
+    print(f"\nCamera {camera_id} complete:")
+    print(f"  - Frames processed: {frame_count}")
+    print(f"  - Total detections: {detection_count}")
+    print(f"  - Unique local tracks: {len(local_tracks_seen)}")
+    print(f"  - Output saved: {output_path}")
 
 
 def main():
     print("="*60)
     print("  Multi-Camera Tracking System - Phase 3")
+    print("  Using DeepSORT + Global ID Matching")
     print("="*60)
     
-    print("\n[1] Loading YOLO...")
+    # Load YOLO model
+    print("\n[1] Loading YOLO model...")
     model = YOLO('yolov8n.pt')
+    print("    ✓ YOLO loaded")
     
-    print("[2] Initializing Global ID Manager...")
+    # Initialize global ID manager
+    print("\n[2] Initializing Global ID Manager...")
     global_id_manager = GlobalIDManager(similarity_threshold=0.5)
+    print("    ✓ Global ID Manager ready")
+    print(f"    - Similarity threshold: 0.5")
     
+    # Define camera sources
     cameras = [
         ('data/videos/cam1.mp4', 1),
         ('data/videos/cam2.mp4', 2),
     ]
     
-    print("\n[3] Processing cameras...\n")
+    # Process each camera
+    print("\n[3] Processing cameras...")
     for video_path, camera_id in cameras:
         process_camera(video_path, camera_id, model, global_id_manager)
     
+    # Print final statistics
     print("\n" + "="*60)
-    print("  FINAL RESULTS")
+    print("  FINAL STATISTICS")
     print("="*60)
     
     stats = global_id_manager.get_stats()
-    print(f"\n✓ Total unique global IDs: {stats['total_global_ids']}")
-    print(f"✓ Cross-camera matches: {stats['cross_camera_matches']}")
+    print(f"Total unique global IDs: {stats['total_global_ids']}")
+    print(f"Cross-camera matches: {stats['cross_camera_matches']}")
     
     if stats['cross_camera_ids']:
-        print(f"\n🎯 Global IDs seen across multiple cameras:")
+        print(f"\nGlobal IDs seen in multiple cameras:")
         for gid in stats['cross_camera_ids']:
-            cameras = sorted(global_id_manager.global_tracks[gid]['cameras'])
-            print(f"   → Global ID {gid}: Cameras {cameras}")
-    else:
-        print("\n⚠ No cross-camera matches found")
-        print("   (This is normal if videos don't show the same people)")
+            cameras = global_id_manager.global_tracks[gid]['cameras']
+            print(f"  - Global ID {gid}: Cameras {sorted(cameras)}")
     
     print("\n✓ Processing complete!")
-    print("📁 Output videos: output/camera*_global.mp4\n")
+    print("Output videos saved to: output/camera*_global.mp4")
 
 
 if __name__ == "__main__":
